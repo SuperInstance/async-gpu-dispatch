@@ -1,0 +1,7 @@
+[package]
+name = "async-gpu-dispatch"
+version = "0.1.0"
+edition = "2021"
+description = "Experiment: async GPU kernel dispatch modeled on open-parallel's tokio-style runtime. Tests how futures, channels, and task scheduling compose with GPU command queues."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/async-gpu-dispatch"

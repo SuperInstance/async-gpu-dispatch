@@ -1,93 +1,71 @@
 # async-gpu-dispatch
 
-Experiment: async GPU kernel dispatch modeled on open-parallel's tokio-style runtime. Tests how futures, channels, and task scheduling compose with GPU command queues.
+**Async GPU command dispatch with priority scheduling, pipeline composition, and queue management**
 
-## Why This Matters
+`async-gpu-dispatch` models a tokio-style async runtime for GPU command dispatch. Commands are submitted non-blocking, queued with priorities, executed in order or by priority, and results are polled — mirroring how real GPU command queues work with CUDA streams, but with Rust's Future-inspired API.
 
-# async-gpu-dispatch
-Tests how open-parallel's async model composes with GPU kernel dispatch.
-Models tokio-style futures, channels, and task scheduling for GPU commands.
+## Background
 
-## The Five-Layer Stack
+GPU computation is inherently asynchronous: you submit a kernel launch and it runs later. CUDA provides streams for managing async execution, but the API is C-based and doesn't compose well with Rust's async ecosystem. Open-parallel (the Oxide stack's async layer) needs a dispatch model that feels like tokio — `submit()`, `poll()`, `execute()` — while faithfully representing GPU queue semantics.
 
-This crate is part of the **Oxide Stack** — a distributed GPU runtime built on five layers:
+`async-gpu-dispatch` provides this bridge. It models a GPU command queue with bounded depth, priority-aware scheduling, batch execution, and pipeline composition. Each command carries a kernel name, block dimensions, shared memory requirements, and a priority level. Results include execution time and throughput metrics.
 
-```
-┌─────────────────┐
-│  cudaclaw        │  Persistent GPU kernels, warp consensus, SmartCRDT
-├─────────────────┤
-│  cuda-oxide      │  Flux → MIR → Pliron → NVVM → PTX compiler
-├─────────────────┤
-│  flux-core       │  Bytecode VM + A2A agent protocol
-├─────────────────┤
-│  pincher         │  "Vector DB as runtime, LLM as compiler"
-├─────────────────┤
-│  open-parallel   │  Async runtime (tokio fork)
-└─────────────────┘
-```
+## How It Works
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+### Command Model
 
-## Design
+A `GpuCommand` specifies:
+- **Kernel name**: Identifies the GPU kernel to launch
+- **Block dimensions**: (x, y, z) thread block configuration
+- **Shared memory**: Bytes of shared memory required
+- **Submitted timestamp**: For latency measurement
+- **Priority**: Critical, High, Normal, or Low
 
-Every value in this crate follows **ternary algebra** (Z₃):
+### AsyncGpu Dispatch Queue
 
-| Value | Meaning | GPU Analog |
-|-------|---------|------------|
-| +1 | Positive / Active / Healthy | Warp vote yes |
-| 0 | Neutral / Pending / Balanced | Warp vote abstain |
-| -1 | Negative / Failed / Overloaded | Warp vote no |
+The `AsyncGpu` struct models a GPU with a bounded command queue:
+- **`submit(cmd)`**: Non-blocking submit. Returns error if queue is full.
+- **`poll()`**: Check for completed results (like `Future::poll`)
+- **`execute_one()`**: Execute the next command from the queue
+- **`execute_all()`**: Batch-execute all pending commands
+- **`execute_by_priority()`**: Execute the highest-priority command first (like work-stealing schedulers)
 
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary LLMs at 60% less power
-2. **GPU warp voting** — hardware ballot returns ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity
+### Pipeline Composition
 
-## Key Types
+`submit_pipeline(&["filter", "transform", "reduce"])` chains kernels where each stage's output feeds into the next. The first stage gets High priority; subsequent stages get Normal.
 
-```rust
-pub struct GpuCommand
-pub enum CommandPriority
-pub struct GpuResult
-pub struct AsyncGpu
-pub fn new
-pub fn submit
-pub fn poll
-pub fn execute_one
-pub fn execute_all
-pub fn execute_by_priority
-pub fn pending_count
-pub fn completed_count
-```
+### Task Model
 
-## Usage
+`GpuTask` wraps a command with a lifecycle: Pending → Running → Completed/Failed. This mirrors tokio's task model.
 
-```toml
-[dependencies]
-async-gpu-dispatch = "0.1.0"
-```
+## Experimental Results
 
-```rust
-use async_gpu_dispatch::*;
-// See src/lib.rs tests for complete working examples
-```
+- **Submit and execute**: Submitting an "attention" kernel and executing produces a result with correct kernel name and success status
+- **Queue full handling**: A queue with depth 2 rejects the third submission
+- **Priority execution**: Among Low, Critical, and Normal commands, Critical executes first
+- **Batch execution**: 50 submitted commands all execute in a single batch call
+- **Pipeline submission**: A 3-kernel pipeline (filter → transform → reduce) queues correctly and executes in order
+- **Task lifecycle**: Tasks transition through Pending → Running → Completed states
+- **Queue utilization**: At 5/10 commands, utilization reports 0.5 (50%)
 
-## Testing
+## Impact
 
-```bash
-git clone https://github.com/SuperInstance/async-gpu-dispatch.git
-cd async-gpu-dispatch
-cargo test    # 7 tests
-```
+This crate provides the **async programming model** for GPU dispatch in the Oxide stack. By mapping tokio's spawn/poll pattern to GPU command queues, it makes GPU programming feel natural to Rust developers who are already familiar with async/await. The priority scheduling enables critical kernels to cut ahead of background work.
 
-## Stats
+## Use Cases
 
-| Metric | Value |
-|--------|-------|
-| Tests | 7 |
-| Lines of Rust | 255 |
-| Public API | 20 items |
+1. **Real-time inference**: Submit attention kernels with Critical priority, background compilation with Low priority
+2. **Pipeline processing**: Chain filter → transform → reduce into a single submission
+3. **Batch inference**: Submit 50 inferences at once, collect all results
+4. **Backpressure management**: Queue-full errors signal when the GPU is saturated
+5. **Priority scheduling**: Ensure latency-sensitive kernels always execute first
 
-## License
+## Open Questions
 
-Apache-2.0
+1. **Real CUDA integration**: The current model is simulated. How should `execute_one()` map to real CUDA kernel launches — through cuBLAS, cuDNN, or custom PTX?
+2. **Multi-GPU dispatch**: How should the dispatch queue extend to multiple GPUs with different capabilities?
+3. **Cancellation**: Should there be a mechanism to cancel pending commands? What happens to in-flight execution?
+
+## Connection to Oxide Stack
+
+Operates at **Layer 1 (open-parallel)** and **Layer 5 (cudaclaw)**. The async model provides the interface between open-parallel's tokio-style runtime and cudaclaw's GPU dispatch. **flux-vm-dispatch** generates the commands that this queue manages, and **flux-autoscale** adjusts the queue depth based on workload.

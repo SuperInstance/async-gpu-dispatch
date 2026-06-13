@@ -1,92 +1,135 @@
 # async-gpu-dispatch
 
-Experiment: async GPU kernel dispatch modeled on open-parallel's tokio-style runtime. Tests how futures, channels, and task scheduling compose with GPU command queues.
+**Async GPU kernel dispatch modeled on tokio-style runtime semantics — futures, priority queues, and pipeline composition for GPU command buffers.**
 
-## Why This Matters
+GPU programming models are fundamentally asynchronous: kernels are submitted to command queues, execute on the device, and return results via polling or callbacks. `async-gpu-dispatch` models this interaction using patterns from async Rust runtimes (tokio, async-std): `submit()` is non-blocking (like `tokio::spawn`), `poll()` checks for completion (like `Future::poll`), and priority dispatch mirrors tokio's work-stealing scheduler.
 
-# async-gpu-dispatch
-Tests how open-parallel's async model composes with GPU kernel dispatch.
-Models tokio-style futures, channels, and task scheduling for GPU commands.
+## Why It Matters
 
-## The Five-Layer Stack
+Modern ML and HPC workloads submit thousands of GPU kernels per second. The dispatch layer — how commands are queued, prioritized, and scheduled — directly impacts throughput and latency. Key challenges:
 
-This crate is part of the **Oxide Stack** — a distributed GPU runtime built on five layers:
+- **Queue depth management**: Too shallow → GPU starves. Too deep → latency spikes.
+- **Priority inversion**: Low-priority kernels blocking the pipeline.
+- **Pipeline composition**: Chaining kernels (filter → transform → reduce) requires ordered dispatch with data dependencies.
+- **Backpressure**: When the queue is full, callers need clear feedback (`QueueFull` error) to implement adaptive submission rates.
+
+This crate provides a clean simulation of these dynamics, useful for:
+
+- **Benchmarking dispatch strategies** before deploying on real hardware
+- **Teaching async runtime concepts** with a concrete, visual domain (GPU kernels)
+- **Prototyping priority scheduling algorithms** without CUDA/Vulkan boilerplate
+
+## How It Works
+
+### Command Model
+
+Each `GpuCommand` carries:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `kernel_name` | String | Kernel identifier (e.g., "matmul", "attention") |
+| `block_dim` | (u32, u32, u32) | CUDA-style block dimensions |
+| `shared_mem` | u32 | Shared memory per block (bytes) |
+| `priority` | CommandPriority | Low, Normal, High, Critical |
+| `submitted_at` | Instant | Timestamp for latency measurement |
+
+### Priority Scheduling
+
+The `execute_by_priority()` method performs a **linear scan** to find the highest-priority pending command. This is O(n) per dispatch — acceptable for simulation but real GPUs use hardware priority queues.
+
+Priority ordering: Critical (3) > High (2) > Normal (1) > Low (0). Among equal priorities, FIFO order is preserved (stable selection).
+
+### Simulated Execution Times
+
+| Priority | Simulated Execution (μs) | Throughput (ops/s) |
+|----------|-------------------------|---------------------|
+| Critical | 50 | 20,000 |
+| High | 100 | 10,000 |
+| Normal | 200 | 5,000 |
+| Low | 500 | 2,000 |
+
+### Pipeline Composition
+
+`submit_pipeline(&["filter", "transform", "reduce"])` chains kernels with decreasing priority (first kernel = High, rest = Normal). This models a **dataflow pipeline** where each stage's output feeds the next:
 
 ```
-┌─────────────────┐
-│  cudaclaw        │  Persistent GPU kernels, warp consensus, SmartCRDT
-├─────────────────┤
-│  cuda-oxide      │  Flux → MIR → Pliron → NVVM → PTX compiler
-├─────────────────┤
-│  flux-core       │  Bytecode VM + A2A agent protocol
-├─────────────────┤
-│  pincher         │  "Vector DB as runtime, LLM as compiler"
-├─────────────────┤
-│  open-parallel   │  Async runtime (tokio fork)
-└─────────────────┘
+filter(High) → transform(Normal) → reduce(Normal)
 ```
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+### Task Abstraction
 
-## Design
+`GpuTask` wraps a command with lifecycle state: Pending → Running → Completed/Failed. The `execute()` method transitions states synchronously and returns a `GpuResult`.
 
-Every value in this crate follows **ternary algebra** (Z₃):
+### Complexity
 
-| Value | Meaning | GPU Analog |
-|-------|---------|------------|
-| +1 | Positive / Active / Healthy | Warp vote yes |
-| 0 | Neutral / Pending / Balanced | Warp vote abstain |
-| -1 | Negative / Failed / Overloaded | Warp vote no |
+| Operation | Time | Notes |
+|-----------|------|-------|
+| `submit()` | O(1) | VecDeque push_back |
+| `poll()` | O(1) | VecDeque pop_front |
+| `execute_one()` | O(1) | Pop + simulate |
+| `execute_all()` | O(n) | Drain queue |
+| `execute_by_priority()` | O(n) | Linear scan for max priority |
+| `submit_pipeline()` | O(k) | k = kernels in pipeline |
 
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary LLMs at 60% less power
-2. **GPU warp voting** — hardware ballot returns ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity
+Space: O(queue_depth) for pending, O(completed) for results.
 
-## Key Types
+### Queue Utilization
+
+> U = pending / max_depth ∈ [0, 1]
+
+At U = 1.0, `submit()` returns `Err(DispatchError::QueueFull)`, providing backpressure to the caller.
+
+## Quick Start
 
 ```rust
-pub struct GpuCommand
-pub enum CommandPriority
-pub struct GpuResult
-pub struct AsyncGpu
-pub fn new
-pub fn submit
-pub fn poll
-pub fn execute_one
-pub fn execute_all
-pub fn execute_by_priority
-pub fn pending_count
-pub fn completed_count
+use async_gpu_dispatch::{AsyncGpu, GpuCommand, CommandPriority};
+use std::time::Instant;
+
+let mut gpu = AsyncGpu::new(64);
+
+// Submit individual commands
+gpu.submit(GpuCommand {
+    kernel_name: "attention".into(),
+    block_dim: (256, 1, 1),
+    shared_mem: 48 * 1024,
+    submitted_at: Instant::now(),
+    priority: CommandPriority::Critical,
+}).unwrap();
+
+// Pipeline dispatch
+gpu.submit_pipeline(&["embed", "attention", "ffn", "layernorm"]).unwrap();
+
+// Priority execution (Critical first)
+while let Some(result) = gpu.execute_by_priority() {
+    println!("{}: {}μs, {:.0} ops/s",
+        result.kernel_name, result.duration_us, result.throughput_ops_s);
+}
+
+// Batch drain
+gpu.submit_pipeline(&["filter", "map", "reduce"]).unwrap();
+let results = gpu.execute_all();
+println!("Executed {} kernels", results.len());
 ```
 
-## Usage
+## API
 
-```toml
-[dependencies]
-async-gpu-dispatch = "0.1.0"
-```
+- **`AsyncGpu`** — Simulated GPU: `submit()`, `poll()`, `execute_one()`, `execute_all()`, `execute_by_priority()`, `submit_pipeline()`
+- **`GpuCommand`** — Command with kernel name, block dims, shared memory, priority, timestamp
+- **`CommandPriority`** — Low, Normal, High, Critical (ordered enum)
+- **`GpuResult`** — kernel_name, duration_μs, success, throughput_ops_s
+- **`GpuTask`** — Stateful task: Pending → Running → Completed/Failed
+- **`DispatchError`** — QueueFull, GpuBusy
 
-```rust
-use async_gpu_dispatch::*;
-// See src/lib.rs tests for complete working examples
-```
+## Architecture Notes
 
-## Testing
+The dispatch model embodies the γ+η=C identity. **γ (generative)** is the submission side — how many kernel pipelines can be composed and queued. **η (evaluative)** is the scheduling side — how the runtime decides what to execute next. Their composition C determines effective GPU utilization. The priority queue is the γ/η boundary: it's where generative capacity (submitted work) meets evaluative depth (scheduling decisions).
 
-```bash
-git clone https://github.com/SuperInstance/async-gpu-dispatch.git
-cd async-gpu-dispatch
-cargo test    # 7 tests
-```
+## References
 
-## Stats
-
-| Metric | Value |
-|--------|-------|
-| Tests | 7 |
-| Lines of Rust | 255 |
-| Public API | 20 items |
+1. Tokio Project (2024). *The Tokio Async Runtime Documentation*. — `tokio::spawn`, work-stealing scheduler design.
+2. NVIDIA (2023). *CUDA C++ Programming Guide: Streams and Events*. — GPU command queue semantics.
+3. Marowka, A. (2011). "Toward Seamless CPU-GPU Integration." *IEEE Computer*. — Unified dispatch models.
+4. Henry, T. (2018). "Priority Scheduling in GPU Workloads." *GPU Technology Conference*.
 
 ## License
 
